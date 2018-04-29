@@ -39,13 +39,13 @@ train_reader = modifiedInHospitalMortalityReader(dataset_dir="../data/in-hospita
                                              listfile="../data/in-hospital-mortality/train/listfile.csv",
                                              period_length=48.0)
 
-#test_reader = modifiedInHospitalMortalityReader(dataset_dir="../data/in-hospital-mortality/test",
-#                                             listfile="../data/in-hospital-mortality/test/listfile.csv",
-#                                             period_length=48.0)
+test_reader = modifiedInHospitalMortalityReader(dataset_dir="../data/in-hospital-mortality/test",
+                                             listfile="../data/in-hospital-mortality/test/listfile.csv",
+                                             period_length=48.0)
 
 # Dictionary of X, y, t..
 data_dict_train = common_utils.read_chunk(train_reader, train_reader.get_number_of_examples())
-
+data_dict_test = common_utils.read_chunk(test_reader, test_reader.get_number_of_examples())
 
 class dataTransformer(TransformerMixin):
     def __init__(self):
@@ -112,6 +112,7 @@ class dataTransformer(TransformerMixin):
 
 d = dataTransformer()
 df = d.transform(data_dict_train)
+df_test = d.transform(data_dict_test)
 
 # =============================================================================
 # Feature extraction
@@ -127,12 +128,7 @@ settings = MinimalFCParameters()
 def extractTSFeatures(df, data_dict, settings):
     features = extract_features(df,column_id="subject_id",column_sort="Hours",column_kind="variable", column_value="value",default_fc_parameters=settings)
         
-    # Order labels
-    label_indexes = np.array([n[:n.find("_timeseries")] for n in data_dict["name"]])
-    idx = np.array([np.where(e==label_indexes)[0][0] for e in np.array(features.index)])
-    labels = np.array(data_dict["y"])[idx]
-        
-    return(features, labels)
+    return features
 
 
 fc_parameters = {
@@ -158,9 +154,22 @@ fc_parameters = {
     "sum_values": None
 }
 
-features_train, y_train = extractTSFeatures(df, data_dict_train, fc_parameters)
-#features_test, y_test = extractTSFeatures(df, data_dict_test, None)
+#features_train = extractTSFeatures(df, data_dict_train, fc_parameters)
+#features_test = extractTSFeatures(df_test, data_dict_test, fc_parameters)
+
+features_train = pd.read_csv("Features dataset/features_train.csv")
+def orderLabels(features,data_dict):
+    labels = pd.DataFrame(list(zip(data_dict["name"],data_dict["y"])),columns=["name","y"])
+    labels.name = labels.name.apply(lambda x: x[:x.find("_timeseries.csv")])
+    new = features_train.merge(labels,how="left", left_on="id", right_on="name") 
+    assert(new.shape[0]==features.shape[0])
     
+    return new.y.values #labels
+
+
+y_train = orderLabels(features_train, data_dict_train)
+features_train = features_train.drop(columns=["id"])
+
 
 # Check which columns have too many missing values
 column_density = np.array([features_train[c].count()/features_train.shape[0] for c in features_train.columns])
@@ -172,22 +181,32 @@ from sklearn.preprocessing import Imputer
 imputer = Imputer()
 X_train = imputer.fit_transform(X_train.values)
 
-# Smote 
-from imblearn.over_sampling import SMOTE
-sm = SMOTE(random_state=40)
-X_train_res, y_train_res = sm.fit_sample(X_train, y_train)
+# Standardize data
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+
+# Select best features
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import Ridge
+rr_model = Ridge(alpha=2)
+rfe = RFE(estimator=rr_model, n_features_to_select=50)
+rfe.fit(X_train,y_train)
+X_train = X_train[:,rfe.support_]
+
+
 
 # =============================================================================
 # Fit logistic regression model
 # =============================================================================
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import roc_curve, precision_recall_curve, auc, roc_auc_score, average_precision_score
+from imblearn.over_sampling import SMOTE
 
 
-logisticModel = LogisticRegression(penalty="l2")
-penalty = ["l1", "l2"]
-regularisation = [0.0001, 0.001, 0.01, 0.5, 0.8]
+penalty = ["l2"]
+regularisation = [0.1, 1, 10, 100, 1000]
 
 def chooseOptimalParameters(penalty, regularisation, X_train, y_train):
     auroc = {}
@@ -195,19 +214,33 @@ def chooseOptimalParameters(penalty, regularisation, X_train, y_train):
     
     for p in penalty:
         for r in regularisation:
+            auroc[(p,r)] = []
+            auprc[(p,r)] = []
+            logisticModel = LogisticRegression(penalty=p, C=r, solver="newton-cg",max_iter=1000)
+            print(logisticModel)
             
-            kf = KFold(n_splits=5)
-            for train_fold_idx, cv_fold_idx in kf.split(X_train):
-                logisticModel.fit(X_train[train_fold_idx], y_train[train_fold_idx]) 
+            kf = StratifiedKFold(n_splits=5)
+            for train_fold_idx, cv_fold_idx in kf.split(X_train, y_train):
+                # Smote 
+                sm = SMOTE(random_state=40)
+                X_train_res, y_train_res = sm.fit_sample(X_train[train_fold_idx], y_train[train_fold_idx])
+                
+                logisticModel.fit(X_train_res, y_train_res) 
                 y_pred = logisticModel.predict(X_train[cv_fold_idx])
                 
                 # AUPRC
                 precision, recall, _ = precision_recall_curve(y_train[cv_fold_idx], y_pred)
-                auprc[(p,r)] = auc(recall,precision)
+                auprc[(p,r)].append(auc(recall,precision))
                 
                 # AUROC 
                 fpr, tpr, _ = roc_curve(y_train[cv_fold_idx], y_pred)
-                auroc[(p,r)] = auc(fpr,tpr)
+                auroc[(p,r)].append(auc(fpr,tpr))
    
     return auroc, auprc
+
+
+auroc, auprc = chooseOptimalParameters(penalty, regularisation, X_train, y_train)
+
+
+
 
